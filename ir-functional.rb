@@ -1,41 +1,215 @@
-#!/usr/bin/env ruby
-
-# Securitysquirrel Incident Response workflow by rmogull@securosis.com
+# Securitysquirrel Incident Response workflow proof of concept by rmogull@securosis.com
+# Copyright 2014 Rich Mogull and DisruptOps, Inc. No other use is authorized.
 
 # You must install the listed gems..
 # This version is a subset of the public SecuritySquirrel code, enhancing the Incident Response workflow
 
 # TODO list:
-# Change to case/switch on the config file
-# Check all variable scopes and adjust
-# Automatically create the quarantine security group instead of relying on it as an option
+# TODO Adjust the omnisearch to search across regions and accounts. Basically, iterate through all accounts configured for that user.
+#   This will eventially pull based on accounts configured for the given project.
+# TODO When we convert this to a real UI, we will want to allow filtering in the search box, per UX guidelines.
+# TODO Take a list of regions, and re-code the omnisearch to roll through all configured regions
+# TODO Add search for Trinity projects and tags. For projects, we can add "search other projects"
+#   as an option, in case they opened the workflow in the wrong project.
+# TODO Add pagination for all searches. Again, for speed, not doing that now.
+# TODO Adjust tag pre-fetch and search to handle multiple accounts and regions.
+# TODO Once the user searches on an instance, build instance metadata and analysis so user can research
+#   instance before taking action. 
+# TODO Adjust the IP search to account for multiple instances due to overlapping VPCs and accounts, and let the user select.
 # TODO evaluate if IAM policy to restrict IR access is set up properly and fix if it isn't
-# TODO update all use of credentials to use AssumeRole
+# TODO evaluate if Quarantine security group is configured properly, and fix if it isn't
+# TODO update all use of credentials to use AssumeRole, and ideally a policy template
 # TODO change the tagging from "IR" to pull the designated tag for the workflow from the DB
-# TODO change console text output to use logger
+# TODO determine if variable scopes are set properly
+# TODO remove all the text/status that currently sends to the console for debugging
+# TODO add state management
+# TODO add logging
+# TODO check that code will work with EC2-classic. This was all tested on EC2-VPC
 # TODO fix to check security group for current VPC, not account/region.
-# Pull the VPC based on the instance, and then alter all the calls to use the current VPC. This should also reduce the need for some config options.
-# Find the forensic analysis server based on an AMI name? Then default to Amazon Linux if there isn't one.
-# Change from config file to command line options as much as possible. Order should be to check for the config file, then check options
-# Add begin/rescue blocks aroung AWS API calls
 
-# need to have parameters override config file. Parameters should be instance ID, tag, quarantine group, ssh key, image id for forensics server, region
-# accept an array of instances
-# adjust for VPCs- detect the VPC the instance is in
-# Only launch forensics server if AMI provided. Otherwise skip that step
-# work for an autoscale group- isolate one instance, then wipe the rest, option to do a rolling update
+# How to create your configuration file:
+#
+# For the most part it is easy, but until I add some error checking the config needs to be perfect
+# 1. Everything needs to be in the same VPC. If you haven't set up a new VPC, it will work in yoru default.
+# 2. Create a quarantine security group without any ingress rules.
+# 3. Create an analysis security group. The rules don't matter for the demo
+# 4. Use those group IDs in the configuration file/DB entry
+# For this to work in demo mode, everything has to be on one account, in one region, in one VPC. It won't be hard to update the code to be more flexible, but that's the current limitation.
+
 
 
 
 require "rubygems"
 require "aws-sdk"
+require 'aws-sdk-core'
 require "json"
 require 'open-uri'
 require 'netaddr'
-require 'logger'
-require 'optparse'
 require 'pry'
 
+# class for performing an omnisearch
+
+class OmniSearch
+  def initialize(search_item)
+    @search_item = search_item
+    # Load configuration and credentials from a JSON file. Right now hardcoded to config.json in the app drectory.
+    # Load from config file in same directory as code
+    # In the future, we will need to adjust this to rotate through all accounts and regions for the user. AssumeRole should help.
+    creds = JSON.load(File.read('config.json'))
+    # Set credentials... using hard coded for this PoC, but really should be an assumerole in the future.
+    # creds = Aws::Credentials.new("#{creds["aws"]["AccessKey"]}", "#{creds["aws"]["SecretKey"]}")
+    # Create clients for the various services we need. Loading them all here and setting them as Class variables.
+    @@ec2 = Aws::EC2::Client.new(region: "#{$region}")
+    @@loadbalance = elasticloadbalancing = Aws::ElasticLoadBalancing::Client.new(region: "#{$region}")
+  end
+  
+  def identify_instance
+    # determine if we are being given an instance ID, IP address, or tag
+    # need to change this over time to pre-fetch as needed for performance.
+    # should probably pre-fetch when the workload launches, and store the results in elasticache
+    # 
+    
+    # check to see if the search term is an instance ID. If so, we're done.
+    if @search_item[0..1] == "i-" 
+     return @search_item
+     # check to see if it is an IP address
+    elsif  (/(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)/x.match(@search_item))
+      # Check to see if the IP is not Internet routable
+      if ( /(^127\.0\.0\.1)|\n(^10\.)|\n(^172\.1[6-9]\.)|(^172\.2[0-9]\.)|(^172\.3[0-1]\.)|\n(^192\.168\.)\n/x.match(@search_item))
+        #Find the instance ID based on the internal IP address
+        search_result = @@ec2.describe_instances(
+          filters: [
+            {
+              name: "private-ip-address",
+              values: ["#{@search_item}"],
+            },
+          ]
+        )
+        if search_result.reservations.first.members.include?(:instances)
+          search_result = search_result.reservations.first.instances.first.instance_id
+          return search_result
+        else
+          search_result = "This is an non-Internet-routable IP address, but is not associated with an instance in your account and region #{$region}."
+          return search_result
+        end
+        
+      else
+        # See if the instance ID is an elastic IP or external IP address and return the associated instance
+        # Right now, we also see if it is an AWS IP but in a different region, or not tied to the current account
+        # We will update that later to cross-region and cross-account search.
+        begin
+          # Pull the elastic IP based on the IP. If it doesn't exist, set a not-found value
+          # We will overwrite that later if we find the instance a different way
+          # We start with EIP since that is much faster to search on
+          search_result = @@ec2.describe_addresses(public_ips: ["#{@search_item}"])
+          if search_result.addresses.first.instance_id != nil
+            search_result = search_result.addresses.first.instance_id
+            return search_result
+          else search_result = "This is an elastic IP in your account without an associated instance."
+            return search_result
+          end
+        rescue Aws::EC2::Errors::ServiceError
+          # since we didn't find an EIP, see if we can find it as one of AWS's public IPs.
+          # we use the pre-cached list of all AWS IP ranges
+          
+          # convert IP to CIDR using the netaddr gem
+          ip = NetAddr::CIDR.create("#{@search_item}/32")
+          # loop through the current list of AWS CIDR ranges to see if the IP is inside AWS
+          $cidr_list.each do |cidr|
+            # pull the current CIDR range and convert to a CIDR object
+            curcidr = cidr["ip_prefix"]
+            curcidr = NetAddr::CIDR.create("#{curcidr}")
+            # See if the submitted IP is within that range
+            if ip.is_contained?(curcidr)
+              # now we know it is an IP associated with AWS. Check to see if it is associated with an instance.
+              # THIS VERSION ONLY WORKS IF THE REGIONS MATCH!!!
+              # Later we will check multiple regions, but right now it only checks in the configured region and throws
+              #  an error result if the IP is from another region.
+              
+              # check to see if regions match
+              if $region == "#{cidr["region"]}"
+                # check for any instance with that IP address in the region
+                  search_result = @@ec2.describe_instances(
+                    filters: [
+                      {
+                        name: "ip-address",
+                        values: ["#{@search_item}"],
+                      },
+                    ]
+                  )
+                  # TODO check to see if this conditional works
+                  if search_result.reservations.first.members.include?(:instances)
+                    search_result = search_result.reservations.first.instances.first.instance_id
+                    return search_result
+                  else
+                    search_result = "This is an AWS IP address in the current region, but not associated with the current account."
+                    return search_result
+                  end
+              else
+                search_result = "This is an AWS IP address in #{cidr["region"]}, not the current region of #{$region}"
+                return search_result
+              end
+              
+              return search_result
+            end
+          end
+          
+          search_result = "We are unable to identify an instance with that IP address"
+        end
+        return search_result
+      end
+    #identify based on DNS, which could be AWS DNS or ELB. For now, we are skipping Route 53 and regular (registered) DNS
+   # elsif 
+    #identify any instances associated with the tag (if any) and then have the user select
+    elsif $tag_string.include?("#{@search_item}")
+      # We start just looking for arbitrary string match. 
+      # In the future, the next step is to determine the account and region
+      # Then to search that region and build a list of instances with the key and value
+      
+      # build list of instances with the tag as the key
+      search_result_by_key = @@ec2.describe_instances(
+        filters: [
+          {
+            name: "tag-key",
+            values: ["#{@search_item}"],
+          },
+        ]
+      )
+      
+      # build list of instances with the tag as the value
+      search_result_by_value = @@ec2.describe_instances(
+        filters: [
+          {
+            name: "tag-value",
+            values: ["#{@search_item}"],
+          },
+        ]
+      )
+      
+      #conditionals to build out options list, need to loop through and build select box next
+      
+      if search_result_by_key.reservations.first != nil
+        puts search_result_by_key.to_h
+      end
+      
+      if search_result_by_value.reservations.first != nil
+          puts search_result_by_value.to_h
+      end
+      
+      
+      # For both, include the instance ID, the key, and the value
+      # Have user select the instance
+      
+      
+      
+  # elsif ***when we have project names and tags, this is where we will add that search function***
+    else
+      puts "We cannot identify any instances with the listed traits"
+    end
+    
+  end
+  
+end
 
 # class for incident response functions like quarantine.
 class IncidentResponse
@@ -169,7 +343,7 @@ class IncidentResponse
       )
       puts "Snapshots complete with description: IR volume #{vol} of instance #{@instance_id}  at #{timestamp}"
       # get the snapshot id and add it to an array for this instance of the class so we can use it later for forensics
-      @snap = @snap += snap.map(&:snapshot_id)
+      @snap = @snap << snap.snapshot_id
     end
       # Launch a thread to tag the snapshots with "IR" to restrict to the security team.
       # We do this since we need to wait until the snapshot is created for the tags to work.
@@ -719,9 +893,10 @@ def prefetch
  # tag_thread = Thread.new do
     creds = JSON.load(File.read('config.json'))
     # Set credentials... using hard coded for this PoC, but really should be an assumerole in the future.
-    creds = Aws::Credentials.new("#{creds["aws"]["AccessKey"]}", "#{creds["aws"]["SecretKey"]}")
+    # creds = Aws::Credentials.new("#{creds["aws"]["AccessKey"]}", "#{creds["aws"]["SecretKey"]}")
     # Create client for EC2. May need to expand to other services later.
-    ec2 = Aws::EC2::Client.new(credentials: creds, region: "#{$region}")
+    # ec2 = Aws::EC2::Client.new(credentials: creds, region: "#{$region}")
+    ec2 = Aws::EC2::Client.new(region: "#{$region}")
     # Pull tags.
     tag_list = ec2.describe_tags()   
     # Convert to a hash since, later, we will need to combine results from multiple sources.
@@ -738,78 +913,12 @@ end
 # Load defaults. Rightnow, just the region.
 configfile = File.read('config.json')
 config = JSON.parse(configfile)
+$region = "#{config["aws"]["DefaultRegion"]}"
 
 # Load the AWS IP ranges and convert to a hash as a background thread.
 prefetch
 
 
-# Set empty hash to hold command line options
-options = {}
-optparse = OptionParser.new do |opts|
-	# opts.banner = "Usage: NewAccountProvisioner.rb [options] [target account arn]"
-	
-	options[:region] = "us-west-2"
-	opts.on( '-r', '--region REGION', 'Set region. Default is us-west-2' ) do |region|
-		options[:region] = region
-	end
-	
-	options[:log] = "provisioner.log"
-	opts.on( '-l', '--log LOG_DESTINATION', 'Set log destination. Enter a file name or STDOUT. Default is the file provisioner.log' ) do |log|
-		options[:log] = log
-	end
-	
-	opts.on( '-h', '--help', 'Display this screen' ) do
-		puts opts
-		exit
-	end
-
-# Parse the command line options
-optparse.parse!
-# Set the region
-$region = options[:region]
-
-# Load defaults. Right now, just the region.
-configfile = File.read('config.json')
-config = JSON.parse(configfile)
-$region = "#{config["aws"]["DefaultRegion"]}"
-
-# Load the AWS IP ranges and convert to a hash as a background thread.
-# Do. I still need this?
-# prefetch
-
-# Enable logging
-if options[:log] == "STDOUT"
-	$log = Logger.new(STDOUT)
-else
-	$log = Logger.new(options[:log], 'daily')
-end
-
-$log.info("Session started at #{Time.now}")
-
-# Set the required variables based on the arguments. Exit if the ARN is invalid
-begin
-	$target_arn = ARGV.shift	
-	if /arn:aws:iam::[0-9]{12}/x !~ $target_arn
-		$log.error("invalid ARN provided, exiting")
-		puts "Invalid ARN provided, exiting"
-		exit
-	elsif ($target_arn == "") or ($target_arn == nil)
-		puts "No target ARN provided, exiting"
-		exit
-	end
-rescue
-	$log.error("No target ARN provided" )
-	puts "No target ARN provided, exiting"
-	exit
-end
-
-$log.info("ARN set to #{$target_arn}")
-
-# Set the region
-$region = options[:region]
-$log.info("Region set to #{$region}")
-
-=begin
 menuselect = 0
 until menuselect == 7 do
     puts "\e[H\e[2J"
@@ -897,8 +1006,4 @@ until menuselect == 7 do
     else 
       puts "Error, please select a valid option"
     end
-end
-=end
-
-$log.close
 end

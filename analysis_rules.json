@@ -1,0 +1,11 @@
+{
+	"ServicesByPort": {
+		"Web Server": ["80", "443"],
+		"Database Server": ["3306"],
+		"SSH Server": ["22"],
+		"FTP Server": ["20", "21"],
+		"Telnet Server": ["23"],
+		"Mail server or relay (SMTP)": ["25"],
+		"DNS Server": ["53"]
+	}
+}
